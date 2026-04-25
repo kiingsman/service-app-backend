@@ -5,17 +5,20 @@ const mongoose = require('mongoose');
 const app = express();
 
 // Middleware
+// origin: '*' allows your Vercel frontend to access this API from any location
 app.use(cors({
-  origin: '*' // Allows your Vercel frontend to talk to this backend
+  origin: '*' 
 }));
 app.use(express.json());
 
-// 1. Root route for status check
+// 1. Health Check Route
+// Verifies the server is live at the root URL
 app.get('/', (req, res) => {
   res.send('Service App Backend is Running!');
 });
 
-// 2. The Services API route (Formatted as requested)
+// 2. Services API Route
+// Synchronized with frontend to use 'title' and numeric 'price'
 app.get('/api/services', (req, res) => {
   const services = [
     {
@@ -43,7 +46,8 @@ app.get('/api/services', (req, res) => {
   res.json(services);
 });
 
-// The listen block at the VERY BOTTOM
+// Port Configuration
+// Uses Render's dynamic port or defaults to 5000 for local testing
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is running on port ${PORT}`);
