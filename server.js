@@ -1,7 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-require('dotenv').config(); // Load environment variables
+const crypto = require('crypto'); // Built-in node module for security
+require('dotenv').config();
 
 const app = express();
 
@@ -10,8 +11,6 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // 1. MongoDB Connection
-// We use process.env.MONGO_URI for security. 
-// Locally, it reads from a .env file. On Render, you set it in the dashboard.
 const mongoURI = process.env.MONGO_URI;
 
 if (!mongoURI) {
@@ -22,15 +21,29 @@ if (!mongoURI) {
     .catch(err => console.error("❌ MongoDB Connection Error:", err));
 }
 
-// 2. Data Schema & Model
+// 2. Data Schemas & Models
+
+// Service Schema (Existing)
 const serviceSchema = new mongoose.Schema({
   title: { type: String, required: true },
   price: { type: Number, required: true }
 });
-
 const Service = mongoose.model('Service', serviceSchema);
 
-// 3. GET Route: Fetch services from the actual Database
+// Transaction Schema (New for Paystack)
+const transactionSchema = new mongoose.Schema({
+  reference: { type: String, required: true, unique: true },
+  customerEmail: { type: String, required: true },
+  amount: { type: Number, required: true },
+  status: { type: String, default: 'pending' }, // pending, success, failed
+  paidAt: { type: Date },
+  createdAt: { type: Date, default: Date.now }
+});
+const Transaction = mongoose.model('Transaction', transactionSchema);
+
+// 3. API Routes
+
+// Fetch services (Live from MongoDB)
 app.get('/api/services', async (req, res) => {
   try {
     const services = await Service.find(); 
@@ -40,11 +53,44 @@ app.get('/api/services', async (req, res) => {
   }
 });
 
-// 4. POST Route: Add a new service to the Database
-// You can use this later to add data via Postman or a form
+// Paystack Webhook Callback
+app.post('/api/paystack/webhook', async (req, res) => {
+  try {
+    // Security: Verify the request comes from Paystack using your Secret Key
+    const hash = crypto.createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
+                       .update(JSON.stringify(req.body))
+                       .digest('hex');
+
+    if (hash === req.headers['x-paystack-signature']) {
+      const event = req.body;
+
+      if (event.event === 'charge.success') {
+        const { reference, amount, customer, paid_at } = event.data;
+
+        // Update transaction status in your database
+        await Transaction.findOneAndUpdate(
+          { reference: reference },
+          { 
+            status: 'success', 
+            customerEmail: customer.email,
+            amount: amount / 100, // Convert Kobo back to Naira
+            paidAt: paid_at 
+          },
+          { upsert: true } // Creates the record if it doesn't exist yet
+        );
+        console.log(`✅ Payment verified for reference: ${reference}`);
+      }
+    }
+    res.sendStatus(200); // Always tell Paystack you received the data
+  } catch (error) {
+    console.error("Webhook Error:", error);
+    res.sendStatus(500);
+  }
+});
+
+// Seed Database Route
 app.get('/api/seed', async (req, res) => {
   try {
-    // This is a "Seed" route to add initial data if the DB is empty
     const count = await Service.countDocuments();
     if (count === 0) {
       await Service.insertMany([
@@ -62,7 +108,7 @@ app.get('/api/seed', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('Service App Backend with MongoDB is Running!');
+  res.send('Service App Backend with MongoDB & Paystack Webhooks is Running!');
 });
 
 const PORT = process.env.PORT || 5000;
