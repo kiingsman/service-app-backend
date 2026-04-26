@@ -14,10 +14,7 @@ const server = http.createServer(app);
 
 // 1. Initialize Socket.io
 const io = new Server(server, {
-  cors: {
-    origin: "*", 
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 // Middleware
@@ -40,16 +37,18 @@ const Service = mongoose.model('Service', new mongoose.Schema({
   price: { type: Number, required: true }
 }));
 
-const Transaction = mongoose.model('Transaction', new mongoose.Schema({
-  reference: { type: String, required: true, unique: true },
-  customerEmail: { type: String, required: true },
+// NEW: Booking Model to track specific service sales
+const Booking = mongoose.model('Booking', new mongoose.Schema({
+  userEmail: { type: String, required: true },
+  serviceTitle: { type: String, required: true },
   amount: { type: Number, required: true },
-  status: { type: String, default: 'pending' },
+  status: { type: String, default: 'PENDING' }, // PENDING, PAID, COMPLETED
+  reference: { type: String, required: true, unique: true },
   paidAt: { type: Date },
   createdAt: { type: Date, default: Date.now }
 }));
 
-// 4. Auth Routes (Register/Login)
+// 4. Auth Routes
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -58,7 +57,7 @@ app.post('/api/auth/register', async (req, res) => {
     await newUser.save();
     res.status(201).json({ message: "User created successfully" });
   } catch (err) {
-    res.status(400).json({ message: "Registration failed. Email might exist." });
+    res.status(400).json({ message: "Registration failed." });
   }
 });
 
@@ -66,24 +65,27 @@ app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   const user = await User.findOne({ email });
   if (user && await bcrypt.compare(password, user.password)) {
-    // Uses JWT_SECRET from your Render Env Variables [cite: 2026-04-26]
-    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'dev_secret', { expiresIn: '1h' });
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'kano_secret', { expiresIn: '1h' });
     res.json({ token, email: user.email });
   } else {
     res.status(401).json({ message: "Invalid credentials" });
   }
 });
 
-// 5. Paystack Initialization
+// 5. Booking & Payment Initialization
 app.post('/api/payments/initialize', async (req, res) => {
   try {
-    const { email, amount } = req.body;
+    const { email, amount, serviceTitle } = req.body;
+    
+    // Convert to Kobo for Paystack
+    const amountInKobo = Math.round(Number(amount) * 100);
+
     const response = await axios.post(
       'https://api.paystack.co/transaction/initialize',
       {
-        email,
-        amount: amount * 100, // Paystack uses Kobo
-        callback_url: "https://service-app-frontend-six.vercel.app/" 
+        email: email,
+        amount: amountInKobo,
+        callback_url: "https://service-app-frontend-six.vercel.app/"
       },
       {
         headers: {
@@ -92,26 +94,39 @@ app.post('/api/payments/initialize', async (req, res) => {
         }
       }
     );
+
+    // ARCHITECTURE STEP: Create a PENDING booking in our DB first
+    const newBooking = new Booking({
+      userEmail: email,
+      serviceTitle: serviceTitle || "General Service",
+      amount: amount,
+      reference: response.data.data.reference,
+      status: 'PENDING'
+    });
+    await newBooking.save();
+
     res.json(response.data.data); 
   } catch (error) {
-    res.status(500).json({ message: "Paystack initialization error" });
+    console.error("Paystack Init Error:", error.response ? error.response.data : error.message);
+    res.status(500).json({ message: "Payment failed to initialize" });
   }
 });
 
-// 6. Paystack Webhook
+// 6. Webhook: Mark Booking as PAID
 app.post('/api/paystack/webhook', async (req, res) => {
   const hash = crypto.createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
                      .update(JSON.stringify(req.body)).digest('hex');
 
   if (hash === req.headers['x-paystack-signature']) {
-    const { reference, amount, customer, paid_at } = req.body.data;
+    const { reference, paid_at } = req.body.data;
+    
     if (req.body.event === 'charge.success') {
-      await Transaction.findOneAndUpdate(
-        { reference },
-        { status: 'success', customerEmail: customer.email, amount: amount / 100, paidAt: paid_at },
-        { upsert: true }
+      // ARCHITECTURE STEP: Update Booking to PAID
+      await Booking.findOneAndUpdate(
+        { reference: reference },
+        { status: 'PAID', paidAt: paid_at }
       );
-      console.log(`✅ Payment success: ${reference}`);
+      console.log(`✅ Booking confirmed & paid: ${reference}`);
     }
   }
   res.sendStatus(200);
@@ -131,7 +146,13 @@ app.get('/api/services', async (req, res) => {
   res.json(services);
 });
 
-app.get('/', (req, res) => res.send('Backend is Active!'));
+// Optional: Get User Bookings
+app.get('/api/bookings/:email', async (req, res) => {
+  const userBookings = await Booking.find({ userEmail: req.params.email }).sort({ createdAt: -1 });
+  res.json(userBookings);
+});
+
+app.get('/', (req, res) => res.send('Kano Cloud Marketplace API - Booking Model Active!'));
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
