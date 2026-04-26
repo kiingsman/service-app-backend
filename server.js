@@ -37,12 +37,15 @@ const Service = mongoose.model('Service', new mongoose.Schema({
   price: { type: Number, required: true }
 }));
 
-// NEW: Booking Model to track specific service sales
+// CORE BUSINESS LOGIC: Enhanced Booking Model
 const Booking = mongoose.model('Booking', new mongoose.Schema({
   userEmail: { type: String, required: true },
   serviceTitle: { type: String, required: true },
   amount: { type: Number, required: true },
-  status: { type: String, default: 'PENDING' }, // PENDING, PAID, COMPLETED
+  status: { type: String, default: 'PENDING' }, // PENDING, PAID, ACCEPTED, COMPLETED, CANCELLED
+  date: { type: String },    // User's requested service date
+  address: { type: String }, // Physical location in Kano or elsewhere
+  notes: { type: String },   // Special instructions/Urgent fix notes
   reference: { type: String, required: true, unique: true },
   paidAt: { type: Date },
   createdAt: { type: Date, default: Date.now }
@@ -75,9 +78,8 @@ app.post('/api/auth/login', async (req, res) => {
 // 5. Booking & Payment Initialization
 app.post('/api/payments/initialize', async (req, res) => {
   try {
-    const { email, amount, serviceTitle } = req.body;
+    const { email, amount, serviceTitle, date, address, notes } = req.body;
     
-    // Convert to Kobo for Paystack
     const amountInKobo = Math.round(Number(amount) * 100);
 
     const response = await axios.post(
@@ -95,11 +97,14 @@ app.post('/api/payments/initialize', async (req, res) => {
       }
     );
 
-    // ARCHITECTURE STEP: Create a PENDING booking in our DB first
+    // Create Booking with full context
     const newBooking = new Booking({
       userEmail: email,
       serviceTitle: serviceTitle || "General Service",
       amount: amount,
+      date: date,
+      address: address,
+      notes: notes,
       reference: response.data.data.reference,
       status: 'PENDING'
     });
@@ -121,7 +126,6 @@ app.post('/api/paystack/webhook', async (req, res) => {
     const { reference, paid_at } = req.body.data;
     
     if (req.body.event === 'charge.success') {
-      // ARCHITECTURE STEP: Update Booking to PAID
       await Booking.findOneAndUpdate(
         { reference: reference },
         { status: 'PAID', paidAt: paid_at }
@@ -132,7 +136,43 @@ app.post('/api/paystack/webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
-// 7. Socket.io Logic
+// 7. Provider & User Lifecycle Endpoints
+// GET User Bookings (For History)
+app.get('/api/bookings/my/:email', async (req, res) => {
+  try {
+    const userBookings = await Booking.find({ userEmail: req.params.email }).sort({ createdAt: -1 });
+    res.json(userBookings);
+  } catch (err) {
+    res.status(500).send(err);
+  }
+});
+
+// GET All Bookings (For @cloud_guy_nigeria Provider View)
+app.get('/api/bookings/provider', async (req, res) => {
+  try {
+    const allJobs = await Booking.find().sort({ createdAt: -1 });
+    res.json(allJobs);
+  } catch (err) {
+    res.status(500).send(err);
+  }
+});
+
+// PUT Update Status (Accept / Complete / Cancel)
+app.put('/api/bookings/:id/status', async (req, res) => {
+  try {
+    const { status } = req.body;
+    const updated = await Booking.findByIdAndUpdate(
+      req.params.id, 
+      { status: status.toUpperCase() }, 
+      { new: true }
+    );
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ message: "Update failed" });
+  }
+});
+
+// 8. Socket.io Logic
 io.on('connection', (socket) => {
   socket.on('join_room', (roomId) => socket.join(roomId));
   socket.on('send_message', (data) => {
@@ -140,19 +180,13 @@ io.on('connection', (socket) => {
   });
 });
 
-// 8. API Routes
+// 9. API Routes
 app.get('/api/services', async (req, res) => {
   const services = await Service.find();
   res.json(services);
 });
 
-// Optional: Get User Bookings
-app.get('/api/bookings/:email', async (req, res) => {
-  const userBookings = await Booking.find({ userEmail: req.params.email }).sort({ createdAt: -1 });
-  res.json(userBookings);
-});
-
-app.get('/', (req, res) => res.send('Kano Cloud Marketplace API - Booking Model Active!'));
+app.get('/', (req, res) => res.send('Cloud Guy Nigeria API - Startup Core Logic Live!'));
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
