@@ -2,17 +2,20 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
-const http = require('http'); // Required for Socket.io
-const { Server } = require('socket.io'); // Required for Socket.io
+const http = require('http');
+const { Server } = require('socket.io');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
-const server = http.createServer(app); // Create HTTP server using express app
+const server = http.createServer(app);
 
-// Initialize Socket.io
+// 1. Initialize Socket.io
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allows your Vercel frontend to connect
+    origin: "*", 
     methods: ["GET", "POST"]
   }
 });
@@ -21,120 +24,114 @@ const io = new Server(server, {
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// 1. MongoDB Connection
-const mongoURI = process.env.MONGO_URI;
+// 2. MongoDB Connection
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB Connected Successfully!"))
+  .catch(err => console.error("❌ MongoDB Connection Error:", err));
 
-if (!mongoURI) {
-  console.error("Error: MONGO_URI is not defined in environment variables.");
-} else {
-  mongoose.connect(mongoURI)
-    .then(() => console.log("✅ MongoDB Connected Successfully!"))
-    .catch(err => console.error("❌ MongoDB Connection Error:", err));
-}
+// 3. Data Schemas & Models
+const User = mongoose.model('User', new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true }
+}));
 
-// 2. Data Schemas & Models
-const serviceSchema = new mongoose.Schema({
+const Service = mongoose.model('Service', new mongoose.Schema({
   title: { type: String, required: true },
   price: { type: Number, required: true }
-});
-const Service = mongoose.model('Service', serviceSchema);
+}));
 
-const transactionSchema = new mongoose.Schema({
+const Transaction = mongoose.model('Transaction', new mongoose.Schema({
   reference: { type: String, required: true, unique: true },
   customerEmail: { type: String, required: true },
   amount: { type: Number, required: true },
   status: { type: String, default: 'pending' },
   paidAt: { type: Date },
   createdAt: { type: Date, default: Date.now }
-});
-const Transaction = mongoose.model('Transaction', transactionSchema);
+}));
 
-// 3. Socket.io Real-Time Logic
-io.on('connection', (socket) => {
-  console.log('⚡ A user connected:', socket.id);
-
-  // User joins a specific chat room (e.g., an order ID)
-  socket.on('join_room', (roomId) => {
-    socket.join(roomId);
-    console.log(`👤 User joined room: ${roomId}`);
-  });
-
-  // Handling incoming messages
-  socket.on('send_message', (data) => {
-    // Sends message to everyone in the room except the sender
-    socket.to(data.roomId).emit('receive_message', data);
-    console.log(`📩 Message sent to room ${data.roomId}`);
-  });
-
-  socket.on('disconnect', () => {
-    console.log('❌ User disconnected');
-  });
-});
-
-// 4. API Routes
-app.get('/api/services', async (req, res) => {
+// 4. Auth Routes (Register/Login)
+app.post('/api/auth/register', async (req, res) => {
   try {
-    const services = await Service.find(); 
-    res.json(services);
+    const { email, password } = req.body;
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = new User({ email, password: hashedPassword });
+    await newUser.save();
+    res.status(201).json({ message: "User created successfully" });
   } catch (err) {
-    res.status(500).json({ message: "Error fetching data from database" });
+    res.status(400).json({ message: "Registration failed. Email might exist." });
   }
 });
 
-app.post('/api/paystack/webhook', async (req, res) => {
-  try {
-    const hash = crypto.createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
-                       .update(JSON.stringify(req.body))
-                       .digest('hex');
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  if (user && await bcrypt.compare(password, user.password)) {
+    // Uses JWT_SECRET from your Render Env Variables [cite: 2026-04-26]
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'dev_secret', { expiresIn: '1h' });
+    res.json({ token, email: user.email });
+  } else {
+    res.status(401).json({ message: "Invalid credentials" });
+  }
+});
 
-    if (hash === req.headers['x-paystack-signature']) {
-      const event = req.body;
-      if (event.event === 'charge.success') {
-        const { reference, amount, customer, paid_at } = event.data;
-        await Transaction.findOneAndUpdate(
-          { reference: reference },
-          { 
-            status: 'success', 
-            customerEmail: customer.email,
-            amount: amount / 100, 
-            paidAt: paid_at 
-          },
-          { upsert: true }
-        );
-        console.log(`✅ Payment verified for reference: ${reference}`);
+// 5. Paystack Initialization
+app.post('/api/payments/initialize', async (req, res) => {
+  try {
+    const { email, amount } = req.body;
+    const response = await axios.post(
+      'https://api.paystack.co/transaction/initialize',
+      {
+        email,
+        amount: amount * 100, // Paystack uses Kobo
+        callback_url: "https://service-app-frontend-six.vercel.app/" 
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          'Content-Type': 'application/json'
+        }
       }
-    }
-    res.sendStatus(200);
+    );
+    res.json(response.data.data); 
   } catch (error) {
-    console.error("Webhook Error:", error);
-    res.sendStatus(500);
+    res.status(500).json({ message: "Paystack initialization error" });
   }
 });
 
-app.get('/api/seed', async (req, res) => {
-  try {
-    const count = await Service.countDocuments();
-    if (count === 0) {
-      await Service.insertMany([
-        { title: "Solar Installation", price: 250000 },
-        { title: "Cybersecurity Audit", price: 50000 },
-        { title: "AC Repair", price: 5000 },
-        { title: "Linguistic Translation", price: 15000 }
-      ]);
-      return res.send("Database seeded with initial services!");
+// 6. Paystack Webhook
+app.post('/api/paystack/webhook', async (req, res) => {
+  const hash = crypto.createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
+                     .update(JSON.stringify(req.body)).digest('hex');
+
+  if (hash === req.headers['x-paystack-signature']) {
+    const { reference, amount, customer, paid_at } = req.body.data;
+    if (req.body.event === 'charge.success') {
+      await Transaction.findOneAndUpdate(
+        { reference },
+        { status: 'success', customerEmail: customer.email, amount: amount / 100, paidAt: paid_at },
+        { upsert: true }
+      );
+      console.log(`✅ Payment success: ${reference}`);
     }
-    res.send("Database already has data.");
-  } catch (err) {
-    res.status(500).send(err.message);
   }
+  res.sendStatus(200);
 });
 
-app.get('/', (req, res) => {
-  res.send('Service App Backend with MongoDB, Paystack & Socket.io is Running!');
+// 7. Socket.io Logic
+io.on('connection', (socket) => {
+  socket.on('join_room', (roomId) => socket.join(roomId));
+  socket.on('send_message', (data) => {
+    socket.to(data.roomId).emit('receive_message', data);
+  });
 });
 
-// 5. Start Server
+// 8. API Routes
+app.get('/api/services', async (req, res) => {
+  const services = await Service.find();
+  res.json(services);
+});
+
+app.get('/', (req, res) => res.send('Backend is Active!'));
+
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
